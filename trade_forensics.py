@@ -31,6 +31,39 @@ COMPONENT_POINTS = {
 }
 
 
+ASSET_CLASS_MAP = {
+    "BTC": "CRYPTO", "ETH": "CRYPTO", "SOL": "CRYPTO", "DOGE": "CRYPTO", "XRP": "CRYPTO",
+    "ADA": "CRYPTO", "AVAX": "CRYPTO", "DOT": "CRYPTO", "LINK": "CRYPTO", "MATIC": "CRYPTO",
+    "GOLD": "METAL", "XAU": "METAL", "XAG": "METAL",
+    "OIL": "ENERGY", "WTI": "ENERGY", "BRENT": "ENERGY",
+    "US500": "INDEX", "SPX": "INDEX", "NDX": "INDEX", "DJI": "INDEX", "VIX": "INDEX",
+    "US30": "INDEX", "DE40": "INDEX", "UK100": "INDEX", "JP225": "INDEX",
+    "AAPL": "STOCK", "MSFT": "STOCK", "GOOGL": "STOCK", "AMZN": "STOCK", "NVDA": "STOCK",
+    "META": "STOCK", "TSLA": "STOCK", "JPM": "STOCK", "MU": "STOCK", "PLTR": "STOCK",
+}
+
+
+def detect_asset_class(symbol: str) -> str:
+    """Observational-only asset class detection from symbol."""
+    if not symbol:
+        return "UNKNOWN"
+    base = symbol.split("/")[0].replace(":USDT", "").replace(":USD", "").upper()
+    # Check known prefixes
+    for prefix, asset_class in ASSET_CLASS_MAP.items():
+        if base.startswith(prefix):
+            return asset_class
+    # Heuristic: if contains known crypto/stock patterns
+    if any(c in base for c in ["USDT", "BTC", "ETH", "BNB", "SOL"]):
+        return "CRYPTO"
+    if any(c in base for c in ["GOLD", "XAU", "SILVER", "XAG"]):
+        return "METAL"
+    if any(c in base for c in ["OIL", "WTI", "BRENT", "NATGAS"]):
+        return "ENERGY"
+    if any(c in base for c in ["US500", "SPX", "NDX", "DJI", "VIX", "US30", "DE40", "UK100", "JP225"]):
+        return "INDEX"
+    return "UNKNOWN"
+
+
 def _safe(v: Any) -> Any:
     if v is None or isinstance(v, (str, bool, int)):
         return v
@@ -108,31 +141,38 @@ class TradeForensics:
             "di_plus": state.get("di_plus_live"),
             "di_minus": state.get("di_minus_live"),
             "atr": state.get("atr"),
-            "rsi": None,
-            "macd": None,
+            "rsi": state.get("rsi_live"),
+            "macd": state.get("macd_live"),
+            "ema": state.get("ema_live"),
+            "sma": state.get("sma_live"),
             "market_regime": state.get("market_regime"),
-            "rf": None,
+            "rf": state.get("rf_live"),
+            "volume": state.get("volume_live"),
+            "structure": state.get("structure_live"),
         }
+        # Fallback to df computation only if not already in state (should not happen in normal flow)
         if df is not None:
             try:
-                close = df["close"]
-                delta = close.diff()
-                gain = delta.clip(lower=0).rolling(14).mean()
-                loss = (-delta.clip(upper=0)).rolling(14).mean()
-                rs = gain / loss.replace(0, float("nan"))
-                out["rsi"] = float((100 - 100 / (1 + rs)).iloc[-1])
+                if out["rsi"] is None:
+                    close = df["close"]
+                    delta = close.diff()
+                    gain = delta.clip(lower=0).rolling(14).mean()
+                    loss = (-delta.clip(upper=0)).rolling(14).mean()
+                    rs = gain / loss.replace(0, float("nan"))
+                    out["rsi"] = float((100 - 100 / (1 + rs)).iloc[-1])
             except Exception:
                 pass
             try:
-                ema12 = df["close"].ewm(span=12, adjust=False).mean()
-                ema26 = df["close"].ewm(span=26, adjust=False).mean()
-                macd = ema12 - ema26
-                signal = macd.ewm(span=9, adjust=False).mean()
-                out["macd"] = {
-                    "value": float(macd.iloc[-1]),
-                    "signal": float(signal.iloc[-1]),
-                    "histogram": float((macd - signal).iloc[-1]),
-                }
+                if out["macd"] is None:
+                    ema12 = df["close"].ewm(span=12, adjust=False).mean()
+                    ema26 = df["close"].ewm(span=26, adjust=False).mean()
+                    macd = ema12 - ema26
+                    signal = macd.ewm(span=9, adjust=False).mean()
+                    out["macd"] = {
+                        "value": float(macd.iloc[-1]),
+                        "signal": float(signal.iloc[-1]),
+                        "histogram": float((macd - signal).iloc[-1]),
+                    }
             except Exception:
                 pass
         return _safe(out)
@@ -175,22 +215,25 @@ class TradeForensics:
         trade_type: str,
         entry_type: str,
         classification: str,
+        leverage: int = 10,
         df=None,
-        asset_class: str = "CRYPTO",
+        asset_class: Optional[str] = None,
     ) -> str:
         with self.lock:
             trade_id = f"DODO-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8].upper()}"
             now = time.time()
             numeric_score = float(score or 0)
             strength = "STRONG" if numeric_score >= 7 else ("MEDIUM" if numeric_score >= 4 else "WEAK")
+            resolved_asset_class = asset_class or detect_asset_class(symbol)
             record = {
                 "trade_id": trade_id,
                 "symbol": symbol,
-                "asset_class": asset_class,
+                "asset_class": resolved_asset_class,
                 "side": side,
                 "entry_time": datetime.fromtimestamp(now, timezone.utc).isoformat(),
                 "entry_price": entry_price,
                 "qty": qty,
+                "leverage": leverage,
                 "sl": sl,
                 "tp1": tp1,
                 "tp2": tp2,

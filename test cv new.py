@@ -2229,6 +2229,42 @@ class LiveTradeManager:
             STATE["current_confidence"] = new_conf
             STATE["prev_di_spread"] = plus_di - minus_di
 
+            # Update runtime evidence for forensics (observational only).
+            try:
+                rf_engine = RFEngine(period=20, multiplier=3.5)
+                STATE["rf_live"] = rf_engine.compute(df_live)
+            except Exception:
+                pass
+            try:
+                STATE["volume_live"] = {
+                    "current": float(df_live["volume"].iloc[-1]),
+                    "prev": float(df_live["volume"].iloc[-2]) if len(df_live) > 1 else None,
+                    "ratio": float(df_live["volume"].iloc[-1] / df_live["volume"].iloc[-21:-1].mean()) if len(df_live) > 21 else None,
+                }
+            except Exception:
+                pass
+            try:
+                close = df_live["close"]
+                STATE["ema_live"] = {
+                    "ema5": float(close.ewm(span=5, adjust=False).mean().iloc[-1]),
+                    "ema15": float(close.ewm(span=15, adjust=False).mean().iloc[-1]),
+                    "ema200": float(close.ewm(span=200, adjust=False).mean().iloc[-1]) if len(close) >= 200 else None,
+                }
+                STATE["sma_live"] = {
+                    "sma20": float(close.rolling(20).mean().iloc[-1]),
+                    "sma50": float(close.rolling(50).mean().iloc[-1]) if len(close) >= 50 else None,
+                }
+            except Exception:
+                pass
+            try:
+                STATE["structure_live"] = {
+                    "bos_up": detect_bos(df_live)[0],
+                    "bos_down": detect_bos(df_live)[1],
+                    "structure_shift": detect_structure_shift(df_live),
+                }
+            except Exception:
+                pass
+
             self.last_heavy_calc_ts = now
         else:
             # Use cached values from STATE
@@ -3821,6 +3857,46 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "in_position": True, "symbol": symbol, "side": side, "entry": price, "qty": qty,
             "tp1_hit": False, "trail_on": False, "last_update_ts": time.time()
         })
+        # Capture runtime evidence for forensics (observational only).
+        rf_at_entry = None
+        if df is not None:
+            try:
+                rf_engine = RFEngine(period=20, multiplier=3.5)
+                rf_at_entry = rf_engine.compute(df)
+            except Exception:
+                pass
+        STATE["rf_live"] = rf_at_entry
+        STATE["leverage"] = LEVERAGE
+        if df is not None:
+            try:
+                STATE["volume_live"] = {
+                    "current": float(df["volume"].iloc[-1]),
+                    "prev": float(df["volume"].iloc[-2]) if len(df) > 1 else None,
+                    "ratio": float(df["volume"].iloc[-1] / df["volume"].iloc[-21:-1].mean()) if len(df) > 21 else None,
+                }
+            except Exception:
+                pass
+            try:
+                close = df["close"]
+                STATE["ema_live"] = {
+                    "ema5": float(close.ewm(span=5, adjust=False).mean().iloc[-1]),
+                    "ema15": float(close.ewm(span=15, adjust=False).mean().iloc[-1]),
+                    "ema200": float(close.ewm(span=200, adjust=False).mean().iloc[-1]) if len(close) >= 200 else None,
+                }
+                STATE["sma_live"] = {
+                    "sma20": float(close.rolling(20).mean().iloc[-1]),
+                    "sma50": float(close.rolling(50).mean().iloc[-1]) if len(close) >= 50 else None,
+                }
+            except Exception:
+                pass
+            try:
+                STATE["structure_live"] = {
+                    "bos_up": detect_bos(df)[0],
+                    "bos_down": detect_bos(df)[1],
+                    "structure_shift": detect_structure_shift(df),
+                }
+            except Exception:
+                pass
         # Start forensic recording only after the trade state is committed.
         try:
             STATE["forensic_trade_id"] = TRADE_FORENSICS.begin_trade(
@@ -3837,8 +3913,8 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
                 trade_type=trade_type,
                 entry_type=entry_type,
                 classification=classification,
+                leverage=LEVERAGE,
                 df=df,
-                asset_class="CRYPTO",
             )
         except Exception as _forensic_exc:
             log_execution(f"[FORENSICS] begin_trade failed: {_forensic_exc}", "WARN")
@@ -3893,6 +3969,46 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "in_position": True, "symbol": symbol, "side": side, "entry": price, "qty": qty,
             "tp1_hit": False, "trail_on": False, "last_update_ts": time.time()
         })
+        # Capture runtime evidence for forensics (observational only).
+        rf_at_entry = None
+        if df is not None:
+            try:
+                rf_engine = RFEngine(period=20, multiplier=3.5)
+                rf_at_entry = rf_engine.compute(df)
+            except Exception:
+                pass
+        STATE["rf_live"] = rf_at_entry
+        STATE["leverage"] = LEVERAGE
+        if df is not None:
+            try:
+                STATE["volume_live"] = {
+                    "current": float(df["volume"].iloc[-1]),
+                    "prev": float(df["volume"].iloc[-2]) if len(df) > 1 else None,
+                    "ratio": float(df["volume"].iloc[-1] / df["volume"].iloc[-21:-1].mean()) if len(df) > 21 else None,
+                }
+            except Exception:
+                pass
+            try:
+                close = df["close"]
+                STATE["ema_live"] = {
+                    "ema5": float(close.ewm(span=5, adjust=False).mean().iloc[-1]),
+                    "ema15": float(close.ewm(span=15, adjust=False).mean().iloc[-1]),
+                    "ema200": float(close.ewm(span=200, adjust=False).mean().iloc[-1]) if len(close) >= 200 else None,
+                }
+                STATE["sma_live"] = {
+                    "sma20": float(close.rolling(20).mean().iloc[-1]),
+                    "sma50": float(close.rolling(50).mean().iloc[-1]) if len(close) >= 50 else None,
+                }
+            except Exception:
+                pass
+            try:
+                STATE["structure_live"] = {
+                    "bos_up": detect_bos(df)[0],
+                    "bos_down": detect_bos(df)[1],
+                    "structure_shift": detect_structure_shift(df),
+                }
+            except Exception:
+                pass
         # Start forensic recording only after the trade state is committed.
         try:
             STATE["forensic_trade_id"] = TRADE_FORENSICS.begin_trade(
@@ -3909,8 +4025,8 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
                 trade_type=trade_type,
                 entry_type=entry_type,
                 classification=classification,
+                leverage=LEVERAGE,
                 df=df,
-                asset_class="CRYPTO",
             )
         except Exception as _forensic_exc:
             log_execution(f"[FORENSICS] begin_trade failed: {_forensic_exc}", "WARN")
