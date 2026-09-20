@@ -9,6 +9,8 @@ services:
     envVars:
       - key: PYTHONUNBUFFERED
         value: "1"
+      - key: PYTHON_VERSION
+        value: "3.12.9"
       - key: PAPER_MODE
         value: "True"
       - key: PORT
