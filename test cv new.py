@@ -24,7 +24,7 @@ import numpy as np
 from flask import Flask, jsonify, request
 import requests
 from dotenv import load_dotenv
-from trade_forensics import TradeForensics
+from trade_forensics import TradeForensics, TradeManagementAuditor
 
 # Load project-local .env before reading configuration.
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), override=False)
@@ -3556,6 +3556,9 @@ _TRADE_LOCK = threading.RLock()
 # Observability-only forensic journal. Never controls trading decisions.
 TRADE_FORENSICS = TradeForensics()
 
+# Observability-only trade management forensic auditor. Never controls trading decisions.
+TRADE_MANAGEMENT_AUDITOR = TradeManagementAuditor()
+
 # ========== DASHBOARD STATE ==========
 DASHBOARD_STATE = {
     "account": {"balance": 0.0, "free_balance": 0.0, "available_margin": 0.0, "mode": "PAPER"},
@@ -6749,6 +6752,8 @@ def forensics_endpoint():
         return jsonify({
             "status": TRADE_FORENSICS.status(),
             "recent_trades": TRADE_FORENSICS.recent_summaries(20),
+            "management_audits": TRADE_MANAGEMENT_AUDITOR.get_recent_audits(20),
+            "management_aggregate": TRADE_MANAGEMENT_AUDITOR.get_aggregate_stats(),
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500

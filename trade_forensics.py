@@ -6,6 +6,10 @@ Observability-only trade intelligence layer.
 It does NOT open, close, size, leverage, modify SL/TP, or alter strategy decisions.
 It records the exact evidence available at entry, during the trade, and at exit,
 then classifies the outcome for later research.
+
+Trade Management Forensic Auditor (added):
+Analyzes trade lifecycle for management failures - determines whether the trade
+was bad or the trade management was defective. Purely observational.
 """
 from __future__ import annotations
 
@@ -16,7 +20,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 
 MILESTONES = (0.5, 1, 2, 3, 5, 10, 20, 30, 40, 60, 80, 100)
@@ -245,6 +249,16 @@ class TradeForensics:
                 "entry_reason": reason,
                 "indicators": self._indicators(state, df),
                 "market_context": self._market_context(state),
+                "runtime_config": {
+                    "breakeven_after_pct": state.get("breakeven_after_pct", 0.30),
+                    "trail_activate_pct": state.get("trail_activate_pct", 0.60),
+                    "tp1_pct": state.get("tp1_pct", 0.40),
+                    "tp1_close_frac": state.get("tp1_close_frac", 0.50),
+                    "atr_mult_trail": state.get("atr_mult_trail", 1.6),
+                    "trail_mult_strong": state.get("trail_mult_strong", 2.0),
+                    "trail_mult_med": state.get("trail_mult_med", 1.5),
+                    "trail_mult_chop": state.get("trail_mult_chop", 1.0),
+                },
                 "mfe_roe": 0.0,
                 "mae_roe": 0.0,
                 "current_roe": 0.0,
@@ -424,3 +438,682 @@ class TradeForensics:
                 "events_file": self.events_path,
                 "summary_file": self.summary_path,
             }
+
+
+# =====================================================================
+# TRADE MANAGEMENT FORENSIC AUDITOR
+# =====================================================================
+# Observability-only: analyzes trade lifecycle for management failures.
+# Determines whether trade was bad or trade management was defective.
+# NEVER opens/closes/modifies trades, SL/TP, leverage, or position size.
+# =====================================================================
+
+class TradeManagementAuditor:
+    """
+    Forensic auditor for trade management behavior.
+    
+    Analyzes completed trades to detect:
+    - Profit protection failures (breakeven, trailing, TP1/TP2)
+    - Stale protection states
+    - Stop-loss protection failures
+    - Exit management failures
+    
+    Purely observational. No trading authority.
+    """
+
+    # Management failure categories
+    FAILURE_CATEGORIES = {
+        "PROFIT_PROTECTION_FAILURE",
+        "TRAILING_PROTECTION_FAILURE",
+        "BREAKEVEN_PROTECTION_FAILURE",
+        "TP1_MANAGEMENT_FAILURE",
+        "TP2_MANAGEMENT_FAILURE",
+        "STOP_PROTECTION_FAILURE",
+        "STALE_PROTECTION_STATE",
+        "EXIT_MANAGEMENT_FAILURE",
+    }
+
+    # Outcome classifications
+    OUTCOME_CLASSIFICATIONS = {
+        "ENTRY_THESIS_FAILURE",
+        "MANAGEMENT_FAILURE",
+        "EXECUTION_FAILURE",
+        "PROTECTION_FAILURE",
+        "MARKET_REGIME_FAILURE",
+        "NORMAL_LOSS",
+        "NORMAL_WIN",
+        "UNKNOWN",
+    }
+
+    # Audit status levels
+    STATUS_LEVELS = {"HEALTHY", "WARNING", "FAILURE", "INSUFFICIENT_EVIDENCE"}
+
+    def __init__(self, data_dir: Optional[str] = None):
+        self.data_dir = data_dir or os.getenv(
+            "TRADE_FORENSICS_DIR",
+            os.path.join(os.path.dirname(__file__), "trade_forensics"),
+        )
+        self.audit_path = os.path.join(self.data_dir, "trade_management_audits.jsonl")
+        self.events_path = os.path.join(self.data_dir, "trade_events.jsonl")
+        self.summary_path = os.path.join(self.data_dir, "trade_summaries.jsonl")
+        self.aggregate_path = os.path.join(self.data_dir, "management_issues_aggregate.json")
+        self.lock = threading.RLock()
+        self._aggregate = self._load_aggregate()
+
+    def _load_aggregate(self) -> Dict[str, Any]:
+        try:
+            with open(self.aggregate_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return {
+                "repeated_issues": {},
+                "total_audited": 0,
+                "failure_counts": {},
+                "last_updated": None,
+            }
+
+    def _save_aggregate(self) -> None:
+        with open(self.aggregate_path, "w", encoding="utf-8") as f:
+            json.dump(self._aggregate, f, ensure_ascii=False, indent=2)
+
+    def _append_audit(self, audit: Dict[str, Any]) -> None:
+        record = dict(audit)
+        record["recorded_at"] = datetime.now(timezone.utc).isoformat()
+        with open(self.audit_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(_safe(record), ensure_ascii=False, separators=(",", ":")) + "\n")
+            f.flush()
+
+    def _read_events(self, trade_id: str) -> List[Dict[str, Any]]:
+        """Read all events for a specific trade_id from trade_events.jsonl."""
+        events = []
+        events_path = os.path.join(self.data_dir, "trade_events.jsonl")
+        try:
+            with open(events_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        evt = json.loads(line)
+                        if evt.get("trade_id") == trade_id:
+                            events.append(evt)
+        except FileNotFoundError:
+            pass
+        return events
+
+    def _read_summary(self, trade_id: str) -> Optional[Dict[str, Any]]:
+        """Read the summary record for a specific trade_id."""
+        try:
+            with open(self.summary_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        rec = json.loads(line)
+                        if rec.get("trade_id") == trade_id:
+                            return rec
+        except FileNotFoundError:
+            pass
+        return None
+
+    def _extract_runtime_config(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract relevant runtime configuration from STATE for expected behavior."""
+        return {
+            "breakeven_after_pct": state.get("breakeven_after_pct", 0.30),
+            "trail_activate_pct": state.get("trail_activate_pct", 0.60),
+            "tp1_pct": state.get("tp1_pct", 0.40),
+            "tp1_close_frac": state.get("tp1_close_frac", 0.50),
+            "atr_mult_trail": state.get("atr_mult_trail", 1.6),
+            "trail_mult_strong": state.get("trail_mult_strong", 2.0),
+            "trail_mult_med": state.get("trail_mult_med", 1.5),
+            "trail_mult_chop": state.get("trail_mult_chop", 1.0),
+        }
+
+    def _build_management_timeline(self, events: List[Dict[str, Any]], summary: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Construct a forensic timeline from entry to exit."""
+        timeline = []
+        
+        # Entry event
+        entry_evt = next((e for e in events if e.get("event") == "ENTRY"), None)
+        if entry_evt:
+            timeline.append({
+                "timestamp": entry_evt.get("recorded_at"),
+                "phase": "ENTRY",
+                "roe": 0.0,
+                "mfe": 0.0,
+                "mae": 0.0,
+                "details": {
+                    "entry_price": entry_evt.get("entry_price"),
+                    "sl": entry_evt.get("sl"),
+                    "tp1": entry_evt.get("tp1"),
+                    "tp2": entry_evt.get("tp2"),
+                    "leverage": entry_evt.get("leverage"),
+                    "score": entry_evt.get("score", {}).get("raw_score"),
+                    "classification": entry_evt.get("classification"),
+                }
+            })
+
+        # Milestone events
+        for evt in events:
+            if evt.get("event") == "MILESTONE":
+                timeline.append({
+                    "timestamp": evt.get("recorded_at"),
+                    "phase": "MILESTONE",
+                    "milestone_pct": evt.get("milestone_pct"),
+                    "roe": evt.get("roe"),
+                    "details": {}
+                })
+
+        # Observation events with protection state
+        for evt in events:
+            if evt.get("event") == "OBSERVATION":
+                protection = evt.get("protection", {})
+                timeline.append({
+                    "timestamp": evt.get("recorded_at"),
+                    "phase": "OBSERVATION",
+                    "roe": evt.get("roe"),
+                    "mfe": evt.get("mfe"),
+                    "mae": evt.get("mae"),
+                    "details": {
+                        "price": evt.get("price"),
+                        "sl": protection.get("sl"),
+                        "tp1": protection.get("tp1"),
+                        "tp2": protection.get("tp2"),
+                        "tp1_hit": protection.get("tp1_hit"),
+                        "tp2_hit": protection.get("tp2_hit"),
+                        "trail_active": protection.get("trail_active"),
+                        "trail_stop": protection.get("trail_stop"),
+                    }
+                })
+
+        # Exit event
+        exit_evt = next((e for e in events if e.get("event") == "EXIT"), None)
+        if exit_evt:
+            exit_data = exit_evt.get("exit", {})
+            timeline.append({
+                "timestamp": exit_evt.get("recorded_at"),
+                "phase": "EXIT",
+                "roe": exit_data.get("pnl_pct"),
+                "details": {
+                    "exit_price": exit_data.get("exit_price"),
+                    "pnl_pct": exit_data.get("pnl_pct"),
+                    "result": exit_data.get("result"),
+                    "reason": exit_data.get("reason"),
+                    "classification": exit_data.get("classification", {}).get("category"),
+                }
+            })
+
+        return timeline
+
+    def _analyze_profit_protection(self, timeline: List[Dict[str, Any]], config: Dict[str, Any]) -> Dict[str, Any]:
+        """Analyze whether profit protection (breakeven/trailing) activated as expected."""
+        findings = {
+            "breakeven": {"expected": False, "actual": False, "evidence": {}},
+            "trailing": {"expected": False, "actual": False, "evidence": {}},
+            "tp1": {"expected": False, "actual": False, "evidence": {}},
+        }
+        
+        be_threshold = config.get("breakeven_after_pct", 0.30) * 100  # Convert to percentage
+        trail_threshold = config.get("trail_activate_pct", 0.60) * 100
+        tp1_threshold = config.get("tp1_pct", 0.40) * 100
+        
+        max_roe_seen = 0.0
+        be_activated_at = None
+        trail_activated_at = None
+        tp1_hit_at = None
+        
+        for evt in timeline:
+            roe = evt.get("roe", 0.0)
+            max_roe_seen = max(max_roe_seen, roe)
+            details = evt.get("details", {})
+            
+            # Check breakeven expectation
+            if not findings["breakeven"]["expected"] and roe >= be_threshold:
+                findings["breakeven"]["expected"] = True
+                findings["breakeven"]["evidence"]["activation_threshold_pct"] = be_threshold
+                findings["breakeven"]["evidence"]["roe_at_check"] = roe
+            
+            if findings["breakeven"]["expected"] and not findings["breakeven"]["actual"]:
+                if details.get("trail_active") is True or details.get("tp1_hit") is True:
+                    findings["breakeven"]["actual"] = True
+                    be_activated_at = evt.get("timestamp")
+                    findings["breakeven"]["evidence"]["activated_at"] = be_activated_at
+            
+            # Check trailing expectation
+            if not findings["trailing"]["expected"] and roe >= trail_threshold:
+                findings["trailing"]["expected"] = True
+                findings["trailing"]["evidence"]["activation_threshold_pct"] = trail_threshold
+                findings["trailing"]["evidence"]["roe_at_check"] = roe
+            
+            if findings["trailing"]["expected"] and not findings["trailing"]["actual"]:
+                if details.get("trail_active") is True:
+                    findings["trailing"]["actual"] = True
+                    trail_activated_at = evt.get("timestamp")
+                    findings["trailing"]["evidence"]["activated_at"] = trail_activated_at
+                    findings["trailing"]["evidence"]["trail_stop"] = details.get("trail_stop")
+            
+            # Check TP1 expectation
+            if not findings["tp1"]["expected"] and roe >= tp1_threshold:
+                findings["tp1"]["expected"] = True
+                findings["tp1"]["evidence"]["activation_threshold_pct"] = tp1_threshold
+                findings["tp1"]["evidence"]["roe_at_check"] = roe
+            
+            if findings["tp1"]["expected"] and not findings["tp1"]["actual"]:
+                if details.get("tp1_hit") is True:
+                    findings["tp1"]["actual"] = True
+                    tp1_hit_at = evt.get("timestamp")
+                    findings["tp1"]["evidence"]["activated_at"] = tp1_hit_at
+        
+        # Determine failures
+        failures = []
+        if findings["breakeven"]["expected"] and not findings["breakeven"]["actual"] and max_roe_seen >= be_threshold:
+            failures.append({
+                "type": "BREAKEVEN_PROTECTION_FAILURE",
+                "severity": "HIGH",
+                "evidence": {
+                    "max_roe": max_roe_seen,
+                    "threshold": be_threshold,
+                    "breakeven_activated": False,
+                    "tp1_hit": findings["tp1"]["actual"],
+                    "trail_activated": findings["trailing"]["actual"],
+                }
+            })
+        
+        if findings["trailing"]["expected"] and not findings["trailing"]["actual"] and max_roe_seen >= trail_threshold:
+            failures.append({
+                "type": "TRAILING_PROTECTION_FAILURE",
+                "severity": "HIGH",
+                "evidence": {
+                    "max_roe": max_roe_seen,
+                    "threshold": trail_threshold,
+                    "trail_activated": False,
+                    "last_sl": timeline[-1].get("details", {}).get("sl") if timeline else None,
+                }
+            })
+        
+        if findings["tp1"]["expected"] and not findings["tp1"]["actual"] and max_roe_seen >= tp1_threshold:
+            failures.append({
+                "type": "TP1_MANAGEMENT_FAILURE",
+                "severity": "MEDIUM",
+                "evidence": {
+                    "max_roe": max_roe_seen,
+                    "threshold": tp1_threshold,
+                    "tp1_hit": False,
+                }
+            })
+        
+        return {"findings": findings, "failures": failures}
+
+    def _analyze_stale_protection(self, timeline: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Detect stale protection states."""
+        failures = []
+        if len(timeline) < 3:
+            return failures
+        
+        # Look for periods where price moved significantly but protection didn't update
+        for i in range(1, len(timeline)):
+            prev = timeline[i-1]
+            curr = timeline[i]
+            
+            prev_details = prev.get("details", {})
+            curr_details = curr.get("details", {})
+            
+            prev_sl = prev_details.get("sl")
+            curr_sl = curr_details.get("sl")
+            prev_trail = prev_details.get("trail_stop")
+            curr_trail = curr_details.get("trail_stop")
+            prev_roe = prev.get("roe", 0)
+            curr_roe = curr.get("roe", 0)
+            roe_change = abs(curr_roe - prev_roe)
+            
+            # If ROE changed significantly (>0.5%) but SL/trail didn't update
+            if roe_change > 0.5 and prev_sl is not None and curr_sl is not None:
+                if prev_sl == curr_sl and curr_roe > prev_roe:  # Price moved favorably but SL static
+                    failures.append({
+                        "type": "STALE_PROTECTION_STATE",
+                        "severity": "MEDIUM",
+                        "evidence": {
+                            "roe_change": roe_change,
+                            "prev_sl": prev_sl,
+                            "curr_sl": curr_sl,
+                            "prev_roe": prev_roe,
+                            "curr_roe": curr_roe,
+                            "timestamp": curr.get("timestamp"),
+                            "trail_stop_changed": prev_trail != curr_trail,
+                        }
+                    })
+        
+        return failures
+
+    def _analyze_stop_protection(self, timeline: List[Dict[str, Any]], summary: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Analyze stop-loss protection effectiveness."""
+        failures = []
+        
+        exit_data = summary.get("exit", {})
+        exit_reason = exit_data.get("reason", "").upper()
+        pnl_pct = exit_data.get("pnl_pct", 0)
+        
+        if "STOP" in exit_reason or "SL" in exit_reason:
+            # Trade hit stop loss - check if protection was adequate
+            mfe = summary.get("mfe_roe", 0)
+            mae = summary.get("mae_roe", 0)
+            
+            # If trade had significant profit but then hit SL, protection may have failed
+            if mfe > 1.0 and pnl_pct < 0:
+                failures.append({
+                    "type": "STOP_PROTECTION_FAILURE",
+                    "severity": "HIGH",
+                    "evidence": {
+                        "mfe_roe": mfe,
+                        "final_pnl_pct": pnl_pct,
+                        "mae_roe": mae,
+                        "profit_gave_back": mfe + abs(pnl_pct),
+                        "exit_reason": exit_reason,
+                    }
+                })
+        
+        return failures
+
+    def _analyze_exit_management(self, timeline: List[Dict[str, Any]], summary: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Analyze exit management quality."""
+        failures = []
+        
+        exit_data = summary.get("exit", {})
+        pnl_pct = exit_data.get("pnl_pct", 0)
+        mfe = summary.get("mfe_roe", 0)
+        mae = summary.get("mae_roe", 0)
+        
+        # Exit management failure: had good MFE but ended with small profit/loss
+        if mfe >= 2.0 and pnl_pct < mfe * 0.3:
+            failures.append({
+                "type": "EXIT_MANAGEMENT_FAILURE",
+                "severity": "MEDIUM",
+                "evidence": {
+                    "mfe_roe": mfe,
+                    "final_pnl_pct": pnl_pct,
+                    "retention_ratio": pnl_pct / mfe if mfe > 0 else 0,
+                    "exit_reason": exit_data.get("reason"),
+                }
+            })
+        
+        return failures
+
+    def _classify_outcome(self, failures: List[Dict[str, Any]], summary: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
+        """Classify the overall outcome: was it entry failure or management failure?"""
+        pnl_pct = summary.get("exit", {}).get("pnl_pct", 0)
+        exit_reason = summary.get("exit", {}).get("reason", "").upper()
+        
+        management_failures = [f for f in failures if f["type"] in self.FAILURE_CATEGORIES]
+        
+        if pnl_pct >= 0:
+            # Winning trade
+            if management_failures:
+                return {
+                    "classification": "NORMAL_WIN",
+                    "management_issues_present": True,
+                    "confidence": "MEDIUM",
+                }
+            return {
+                "classification": "NORMAL_WIN",
+                "management_issues_present": False,
+                "confidence": "HIGH",
+            }
+        
+        # Losing trade - distinguish
+        if management_failures:
+            # Management failure is primary
+            failure_types = [f["type"] for f in management_failures]
+            if "BREAKEVEN_PROTECTION_FAILURE" in failure_types or "TRAILING_PROTECTION_FAILURE" in failure_types:
+                return {
+                    "classification": "MANAGEMENT_FAILURE",
+                    "sub_types": failure_types,
+                    "confidence": "HIGH",
+                }
+            if "STOP_PROTECTION_FAILURE" in failure_types:
+                return {
+                    "classification": "PROTECTION_FAILURE",
+                    "sub_types": failure_types,
+                    "confidence": "HIGH",
+                }
+            if "EXIT_MANAGEMENT_FAILURE" in failure_types:
+                return {
+                    "classification": "MANAGEMENT_FAILURE",
+                    "sub_types": failure_types,
+                    "confidence": "MEDIUM",
+                }
+            return {
+                "classification": "MANAGEMENT_FAILURE",
+                "sub_types": failure_types,
+                "confidence": "MEDIUM",
+            }
+        
+        # No management failures detected - check for entry/thesis failure
+        if "THESIS" in exit_reason or (state.get("thesis_failure_score") or 0) > 0:
+            return {
+                "classification": "ENTRY_THESIS_FAILURE",
+                "confidence": "HIGH",
+            }
+        if "MOMENTUM" in exit_reason or (state.get("momentum_flow") or {}).get("momentum_decay"):
+            return {
+                "classification": "ENTRY_THESIS_FAILURE",
+                "confidence": "MEDIUM",
+            }
+        if "STRUCTURE" in exit_reason:
+            return {
+                "classification": "MARKET_REGIME_FAILURE",
+                "confidence": "MEDIUM",
+            }
+        if "LATE" in exit_reason:
+            return {
+                "classification": "ENTRY_THESIS_FAILURE",
+                "confidence": "MEDIUM",
+            }
+        if "STOP" in exit_reason or "SL" in exit_reason:
+            return {
+                "classification": "NORMAL_LOSS",
+                "confidence": "HIGH",
+            }
+        
+        return {
+            "classification": "UNKNOWN",
+            "confidence": "LOW",
+        }
+
+    def audit_trade(self, trade_id: str, state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Perform full management audit for a closed trade.
+        
+        Returns comprehensive audit result with:
+        - management_timeline
+        - expected_vs_actual
+        - failure_detections
+        - outcome_classification
+        - overall_status
+        """
+        with self.lock:
+            # Read events and summary
+            events = self._read_events(trade_id)
+            summary = self._read_summary(trade_id)
+            
+            if not summary:
+                return {"error": "Trade not found", "trade_id": trade_id}
+            
+            # Build timeline
+            timeline = self._build_management_timeline(events, summary)
+            
+            # Get runtime config from summary (stored at entry time)
+            config = summary.get("runtime_config", {})
+            runtime_state = state or summary.get("market_context", {})
+            if not config:
+                # Fallback to state or defaults
+                config = self._extract_runtime_config(runtime_state)
+            
+            # Run analyses
+            protection_analysis = self._analyze_profit_protection(timeline, config)
+            stale_failures = self._analyze_stale_protection(timeline)
+            stop_failures = self._analyze_stop_protection(timeline, summary)
+            exit_failures = self._analyze_exit_management(timeline, summary)
+            
+            all_failures = protection_analysis["failures"] + stale_failures + stop_failures + exit_failures
+            
+            # Classify outcome
+            outcome = self._classify_outcome(all_failures, summary, runtime_state)
+            
+            # Expected vs Actual matrix
+            expected_vs_actual = {
+                "breakeven": {
+                    "expected": protection_analysis["findings"]["breakeven"]["expected"],
+                    "actual": protection_analysis["findings"]["breakeven"]["actual"],
+                    "evidence": protection_analysis["findings"]["breakeven"]["evidence"],
+                },
+                "trailing": {
+                    "expected": protection_analysis["findings"]["trailing"]["expected"],
+                    "actual": protection_analysis["findings"]["trailing"]["actual"],
+                    "evidence": protection_analysis["findings"]["trailing"]["evidence"],
+                },
+                "tp1": {
+                    "expected": protection_analysis["findings"]["tp1"]["expected"],
+                    "actual": protection_analysis["findings"]["tp1"]["actual"],
+                    "evidence": protection_analysis["findings"]["tp1"]["evidence"],
+                },
+            }
+            
+            # Overall status
+            if not all_failures:
+                overall_status = "HEALTHY"
+            else:
+                severities = [f.get("severity", "LOW") for f in all_failures]
+                if "CRITICAL" in severities:
+                    overall_status = "FAILURE"
+                elif "HIGH" in severities:
+                    overall_status = "FAILURE"
+                elif "MEDIUM" in severities:
+                    overall_status = "WARNING"
+                else:
+                    overall_status = "WARNING"
+            
+            # Build audit record
+            audit = {
+                "trade_id": trade_id,
+                "symbol": summary.get("symbol"),
+                "side": summary.get("side"),
+                "entry_time": summary.get("entry_time"),
+                "exit_time": summary.get("exit", {}).get("exit_time"),
+                "pnl_pct": summary.get("exit", {}).get("pnl_pct"),
+                "mfe_roe": summary.get("mfe_roe"),
+                "mae_roe": summary.get("mae_roe"),
+                "management_timeline": timeline,
+                "expected_vs_actual": expected_vs_actual,
+                "failure_detections": all_failures,
+                "outcome_classification": outcome,
+                "overall_status": overall_status,
+                "protection_quality": self._compute_protection_quality(protection_analysis),
+                "exit_quality": self._compute_exit_quality(summary),
+            }
+            
+            # Persist audit
+            self._append_audit(audit)
+            
+            # Update aggregate
+            self._update_aggregate(audit)
+            
+            return audit
+
+    def _compute_protection_quality(self, protection_analysis: Dict[str, Any]) -> Dict[str, Any]:
+        """Compute a protection quality score (0-100)."""
+        score = 100
+        findings = protection_analysis["findings"]
+        
+        if findings["breakeven"]["expected"]:
+            if findings["breakeven"]["actual"]:
+                score += 0  # Good
+            else:
+                score -= 30  # Missing breakeven
+        
+        if findings["trailing"]["expected"]:
+            if findings["trailing"]["actual"]:
+                score += 0
+            else:
+                score -= 25
+        
+        if findings["tp1"]["expected"]:
+            if findings["tp1"]["actual"]:
+                score += 0
+            else:
+                score -= 15
+        
+        return {
+            "score": max(0, min(100, score)),
+            "breakeven_activated": findings["breakeven"]["actual"],
+            "trailing_activated": findings["trailing"]["actual"],
+            "tp1_hit": findings["tp1"]["actual"],
+        }
+
+    def _compute_exit_quality(self, summary: Dict[str, Any]) -> Dict[str, Any]:
+        """Compute exit quality metrics."""
+        mfe = summary.get("mfe_roe", 0)
+        pnl = summary.get("exit", {}).get("pnl_pct", 0)
+        
+        if mfe > 0:
+            retention = pnl / mfe
+        else:
+            retention = 0.0
+        
+        return {
+            "mfe_roe": mfe,
+            "final_pnl_pct": pnl,
+            "retention_ratio": retention,
+            "quality": "GOOD" if retention >= 0.5 else ("FAIR" if retention >= 0.2 else "POOR"),
+        }
+
+    def _update_aggregate(self, audit: Dict[str, Any]) -> None:
+        """Update aggregate statistics for repeated issue detection."""
+        with self.lock:
+            self._aggregate["total_audited"] = self._aggregate.get("total_audited", 0) + 1
+            self._aggregate["last_updated"] = datetime.now(timezone.utc).isoformat()
+            
+            failures = audit.get("failure_detections", [])
+            for f in failures:
+                ftype = f.get("type", "UNKNOWN")
+                self._aggregate["failure_counts"][ftype] = self._aggregate["failure_counts"].get(ftype, 0) + 1
+                
+                # Track repeated issues
+                if ftype not in self._aggregate["repeated_issues"]:
+                    self._aggregate["repeated_issues"][ftype] = {
+                        "count": 0,
+                        "affected_trades": [],
+                        "severity": f.get("severity", "UNKNOWN"),
+                    }
+                
+                issue = self._aggregate["repeated_issues"][ftype]
+                issue["count"] = issue.get("count", 0) + 1
+                trade_ref = f"{audit.get('trade_id')} ({audit.get('symbol')})"
+                if trade_ref not in issue["affected_trades"]:
+                    issue["affected_trades"].append(trade_ref)
+            
+            self._save_aggregate()
+
+    def get_aggregate_stats(self) -> Dict[str, Any]:
+        """Get aggregate management issue statistics."""
+        with self.lock:
+            return dict(self._aggregate)
+
+    def get_recent_audits(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """Get recent management audits."""
+        audits = []
+        try:
+            with open(self.audit_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        audits.append(json.loads(line))
+        except FileNotFoundError:
+            return []
+        return audits[-max(1, int(limit)):]
+
+    def get_audit_for_trade(self, trade_id: str) -> Optional[Dict[str, Any]]:
+        """Get specific audit by trade_id."""
+        try:
+            with open(self.audit_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        audit = json.loads(line)
+                        if audit.get("trade_id") == trade_id:
+                            return audit
+        except FileNotFoundError:
+            return None
+        return None
