@@ -1,0 +1,20 @@
+
+services:
+  - type: web
+    name: dodo-bot
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python "test cv new.py"
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: PAPER_MODE
+        value: "True"
+      - key: PORT
+        value: "8000"
+      # Required for LIVE (set in Render dashboard as secrets, never commit real values):
+      # - BINGX_API_KEY
+      # - BINGX_API_SECRET
+      # - TELEGRAM_BOT_TOKEN
+      # - TELEGRAM_CHAT_ID
